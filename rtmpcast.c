@@ -7,12 +7,12 @@ Greg Kennedy 2021
 
 #include "rtmpcast.h"
 
+// aac encoder
+#include "audio_fdkaac.h"
+
 // push packets to stream
 #include <librtmp/rtmp.h>
 #include <librtmp/log.h>
-
-// libfdk's AAC encoder header
-#include <fdk-aac/aacenc_lib.h>
 
 // other necessary includes
 #include <stdio.h>
@@ -32,12 +32,6 @@ Greg Kennedy 2021
 
 // maximum size of a tag is 11 byte header, 0xFFFFFF payload, 4 byte size
 #define MAX_TAG_SIZE 11 + 16777215 + 4
-
-// some constants
-static int in_buffer_element_sizes[] = { sizeof(INT_PCM) };
-static int in_buffer_identifiers[]   = { IN_AUDIO_DATA };
-static int out_buffer_element_sizes[] = { sizeof(uint8_t) };
-static int out_buffer_identifiers[]   = { OUT_BITSTREAM_DATA };
 
 /* ************************************************************************ */
 // opaque ptr
@@ -67,24 +61,14 @@ struct rtmpcast_t
 	} video;
 
 	struct {
-		int (* callback)(int16_t * buffer);
-
 		unsigned int samplerate;
 		unsigned int channels;
 		unsigned int bitrate;
 
+		struct encoder_audio * encoder;
+
 		double timestamp_next;
 		double timestamp_increment;
-
-		HANDLE_AACENCODER encoder;
-		AACENC_InfoStruct encoder_info;
-		AACENC_BufDesc in_buf, out_buf;
-
-		INT_PCM * in_buffers[1];
-		int in_buffer_sizes[1];
-
-		uint8_t * out_buffers[1];
-		int out_buffer_sizes[1];
 	} audio;
 };
 
@@ -264,6 +248,10 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 		return NULL;
 	}
 
+	/* *************************************************** */
+	// allocate a very large buffer for all packets and operations
+	r->rtmp.tag = malloc(MAX_TAG_SIZE);
+
 	// copy the callback param
 	if (p->video.enable) {
 		// copy all video-related params
@@ -278,10 +266,18 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 		
 		r->video.timestamp_increment = 1.0 / r->video.framerate;
 
+		// return code handler
+		int ret;
+
 		// Initialize the x264 encoder
 		//  First set up the parameters struct
 		x264_param_t x_p;
-		x264_param_default_preset(&x_p, "veryfast", "zerolatency");
+		ret = x264_param_default_preset(&x_p, "veryfast", "zerolatency");
+		if (ret) {
+			fprintf(stderr, "librtmpcast: ERROR: x264_param_default_preset returned %d\n", ret);
+			free(r);
+			return NULL;
+		}
 		x_p.i_log_level = X264_LOG_INFO;
 		x_p.i_threads = 1;
 		x_p.i_width = r->video.width;
@@ -298,6 +294,7 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 		x_p.rc.i_rc_method = X264_RC_ABR;
 		x_p.rc.i_bitrate = r->video.bitrate;
 		x_p.rc.i_vbv_max_bitrate = r->video.bitrate;
+		x_p.rc.i_vbv_buffer_size = r->video.bitrate;
 	
 		// Control x264 output for muxing
 		x_p.b_aud = 0; // do not generate Access Unit Delimiters
@@ -305,7 +302,12 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 		x_p.b_annexb = 0; // Annex B uses startcodes before NALU, but we want sizes
 	
 		// constraints
-		x264_param_apply_profile(&x_p, "baseline");
+		ret = x264_param_apply_profile(&x_p, "baseline");
+		if (ret) {
+			fprintf(stderr, "librtmpcast: ERROR: x264_param_apply_profile returned %d\n", ret);
+			free(r);
+			return NULL;
+		}
 	
 		/* *************************************************** */
 		// All done setting up params!  Let's open an encoder
@@ -321,7 +323,13 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 
 		// These are the two picture structs.  Input must be alloc()
 		//  Output will be created by the encode process
-		x264_picture_alloc(&r->video.picture, X264_CSP_I420, r->video.width, r->video.height);
+		ret = x264_picture_alloc(&r->video.picture, X264_CSP_I420, r->video.width, r->video.height);
+		if (ret) {
+			fprintf(stderr, "librtmpcast: ERROR: x264_picture_alloc returned %d\n", ret);
+			x264_encoder_close(r->video.encoder);
+			free(r);
+			return NULL;
+		}
 	} else {
 		// clear some values in the struct
 		r->video.callback = NULL;
@@ -338,71 +346,31 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 	// Initialize the AAC encoder
 	if (p->audio.enable) {
 		// copy all params
-		r->audio.callback = p->audio.callback;
 		r->audio.samplerate = p->audio.samplerate;
 		r->audio.channels = p->audio.channels;
-		r->audio.bitrate = p->audio.bitrate * 1024;
+		r->audio.bitrate = p->audio.bitrate;
 
 		// calculate the timestamp interval
 		r->audio.timestamp_increment = 1024.0 / r->audio.samplerate;
 
-		AACENC_ERROR err;
-		// get encoder with support for only basic (AAC-LC) and 1 or 2 channels
-		err = aacEncOpen(&r->audio.encoder, 0x01, r->audio.channels); if (err != AACENC_OK) { fprintf(stderr, "Failed to open encoder: %d\n", err); }
-	
-	#define aacSetParam(x, y) { AACENC_ERROR err = aacEncoder_SetParam(r->audio.encoder, x, y); if (err != AACENC_OK) { fprintf(stderr, "Failed to set param x to y: %d\n", err); } }
-	
-		// give me just AAC-LC output (no HC, SSR, SBR etc)
-		aacSetParam(AACENC_AOT, AOT_AAC_LC); // AAC-LC
-		// Controls the output format of blocks coming from the encoder
-		//  this is just raw outputs (no special framing / container)
-		aacSetParam(AACENC_TRANSMUX, TT_MP4_RAW);
-		// Better quality at the expense of processing power
-		//aacSetParam(AACENC_AFTERBURNER,1);
-	
-		aacSetParam(AACENC_BITRATE, r->audio.bitrate);
-		aacSetParam(AACENC_SAMPLERATE, r->audio.samplerate);
-		// channel arrangement
-		aacSetParam(AACENC_CHANNELMODE, (r->audio.channels == 2 ? MODE_2 : MODE_1) );
-		aacSetParam(AACENC_CHANNELORDER, 1);
-	
-		// This strange call is needed to "lock in" the settings for encoding
-		err = aacEncEncode(r->audio.encoder, NULL, NULL, NULL, NULL); if (err != AACENC_OK) { fprintf(stderr, "Failed to initialize encoder: %d\n", err); }
-	
-		// Now we have encoder info in a struct and can use it for writing audio packets
-		err = aacEncInfo(r->audio.encoder, &r->audio.encoder_info); if (err != AACENC_OK) { fprintf(stderr, "Failed to copy Encoder Info: %d\n", err); }
-		printf("Opened encoder with these values: maxOutBufBytes = %u, maxAncBytes = %u, inBufFillLevel = %u, inputChannels = %u, frameLength = %u, nDelay = %u, nDelayCore = %u\n", r->audio.encoder_info.maxOutBufBytes, r->audio.encoder_info.maxAncBytes, r->audio.encoder_info.inBufFillLevel, r->audio.encoder_info.inputChannels, r->audio.encoder_info.frameLength, r->audio.encoder_info.nDelay, r->audio.encoder_info.nDelayCore);
-		// alloc the INPUT buffer
-		r->audio.in_buf.numBufs           = 1;
-		r->audio.in_buffer_sizes[0]       = 1024 * r->audio.channels * sizeof(INT_PCM);
-		r->audio.in_buf.bufSizes          = r->audio.in_buffer_sizes;
-		r->audio.in_buffers[0]            = malloc(r->audio.in_buffer_sizes[0]);
-		r->audio.in_buf.bufs              = r->audio.in_buffers;
-		// use the constants
-		r->audio.in_buf.bufferIdentifiers = in_buffer_identifiers;
-		r->audio.in_buf.bufElSizes        = in_buffer_element_sizes;
-
-		// alloc the OUTPUT buffer
-		r->audio.out_buf.numBufs           = 1;
-		r->audio.out_buffer_sizes[0]       = 768 * r->audio.channels * sizeof(uint8_t);
-		r->audio.out_buf.bufSizes          = r->audio.out_buffer_sizes;
-		r->audio.out_buffers[0]            = malloc(r->audio.out_buffer_sizes[0]);
-		r->audio.out_buf.bufs              = r->audio.out_buffers;
-		// use the constants
-		r->audio.out_buf.bufferIdentifiers = out_buffer_identifiers;
-		r->audio.out_buf.bufElSizes        = out_buffer_element_sizes;
+		// set up the encoder
+		//  only fdkaac supported for now
+		r->audio.encoder = audio_fdkaac_create(
+			p->audio.channels,
+			p->audio.bitrate * 1024,
+			p->audio.samplerate,
+			p->audio.callback,
+			r->rtmp.tag + 11 + 2
+		);
 	} else {
-		r->audio.callback = NULL;
 		r->audio.samplerate = 0;
 		r->audio.channels = 0;
 		r->audio.bitrate = 0;
 
 		r->audio.timestamp_increment = INFINITY;
-	}
 
-	/* *************************************************** */
-	// allocate a very large buffer for all packets and operations
-	r->rtmp.tag = malloc(MAX_TAG_SIZE);
+		r->audio.encoder = NULL;
+	}
 
 	/* *************************************************** */
 	// Increase the log level for all RTMP actions
@@ -506,8 +474,13 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 	*p = 0xAF; p++;
 	*p = 0; p++;
 
-	memcpy(p, r->audio.encoder_info.confBuf, r->audio.encoder_info.confSize);
-	p += r->audio.encoder_info.confSize;
+	int audio_size = audio_fdkaac_init(r->audio.encoder);
+	if (audio_size < 0) {
+	  // error occurred
+		fputs("Failed to fdkaac_init\n", stderr);
+		return 0;
+	}
+	p += audio_size;
 	// calculate tag size and write it
 	tagSize = flv_TagFinish(r->rtmp.tag, p);
 
@@ -572,40 +545,27 @@ double rtmpcast_update (struct rtmpcast_t * r)
 			r->video.timestamp_next += r->video.timestamp_increment;
 		} else {
 			// time for an audio
+			if (r->audio.encoder) {
+				// build tag header for audio
+				uint8_t * p = flv_TagHeader(r->rtmp.tag, 8, 1000 * (r->audio.timestamp_next - r->rtmp.start));
+				*p = 0xAF; p++;
+				*p = 1; p++;
 
-			if (r->audio.callback) {
-		AACENC_ERROR err;
-				/* *************************************************** */
-				// CALL THE AUDIO CALLBACK
-				AACENC_InArgs in_args;
-				in_args.numAncBytes = 0;
-				in_args.numInSamples = r->audio.callback(r->audio.in_buffers[0]);
-
-				// Perform the encode
-				AACENC_OutArgs out_args; // does not need init - is set by encode
-				if ( (err = aacEncEncode(r->audio.encoder, &r->audio.in_buf, &r->audio.out_buf, &in_args, &out_args)) != AACENC_OK)
-				{
-					fprintf(stderr, "Encoding failed: %d\n", err);
-					return 1;
+				// call out to the chosen encoder
+				int audio_size = audio_fdkaac_update(r->audio.encoder);
+				if (audio_size < 0) {
+					// error in encoding
+					fputs("Error when encoding audio\n", stderr);
+					return 0;
 				}
+				p += audio_size;
 
-				if (out_args.numOutBytes < 0) {
-					fprintf(stderr, "Encoding returned %d bytes\n", out_args.numOutBytes);
-				} else if (out_args.numOutBytes > 0) {
-					// done, build tag
-					uint8_t * p = flv_TagHeader(r->rtmp.tag, 8, 1000 * (r->audio.timestamp_next - r->rtmp.start));
-					*p = 0xAF; p++;
-					*p = 1; p++;
-					memcpy(p, r->audio.out_buffers[0], out_args.numOutBytes);
-					p += out_args.numOutBytes;
+				// calculate tag size and write it
+				uint32_t tagSize = flv_TagFinish(r->rtmp.tag, p);
 
-					// calculate tag size and write it
-					uint32_t tagSize = flv_TagFinish(r->rtmp.tag, p);
-
-					//  cast to char* avoids a warning
-					if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
-						fputs("Failed to RTMP_Write audio block\n", stderr);
-					}
+				//  cast to char* avoids a warning
+				if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
+					fputs("Failed to RTMP_Write audio block\n", stderr);
 				}
 			}
 			r->audio.timestamp_next += r->audio.timestamp_increment;
