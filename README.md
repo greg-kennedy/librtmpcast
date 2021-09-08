@@ -3,6 +3,8 @@ C library for streaming to Twitch (or other RTMP-based services)
 
 Greg Kennedy 2021
 
+**THIS IS BETA SOFTWARE.  INTERFACE AND FEATURES SUBJECT TO CHANGE.  USE AT YOUR OWN RISK!**
+
 ## Overview
 This is a C library which eases the process of streaming audio and video content to RTMP-based services for broadcast.  The target service is Twitch.tv, which accepts only a particular combination of video + audio codecs (h.264 video + AAC audio).  Other services may also work with this library (Periscope, Wowza, Youtube, etc) but are not the primary focus.
 
