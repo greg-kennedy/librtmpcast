@@ -10,6 +10,10 @@ Greg Kennedy 2021
 // aac encoder
 #include "audio_fdkaac.h"
 
+#include "video.h"
+// h264 encoder
+#include "video_x264.h"
+
 // push packets to stream
 #include <librtmp/rtmp.h>
 #include <librtmp/log.h>
@@ -26,10 +30,6 @@ Greg Kennedy 2021
 
 #include <sys/time.h>
 
-// h.264 encoder lib
-//  this requires stdint.h first or else it complains...
-#include <x264.h>
-
 // maximum size of a tag is 11 byte header, 0xFFFFFF payload, 4 byte size
 #define MAX_TAG_SIZE 11 + 16777215 + 4
 
@@ -39,25 +39,27 @@ Greg Kennedy 2021
 struct rtmpcast_t
 {
 	struct {
+		// rtmp stuff
 		RTMP * rtmp;
 		int fd;
+
+		// local copy
+		FILE * flv;
+
 		uint8_t * tag;
 
 		double start;
 	} rtmp;
 
 	struct {
-		int (* callback)(uint8_t * frame[3]);
-
 		unsigned int width, height;
 		unsigned int framerate;
 		unsigned int bitrate;
 
+		struct encoder_video * encoder;
+
 		double timestamp_next;
 		double timestamp_increment;
-
-		x264_t * encoder;
-		x264_picture_t picture;
 	} video;
 
 	struct {
@@ -102,6 +104,7 @@ static uint8_t * u32be(uint8_t * const p, const uint32_t value) {
 }
 
 // deconstruct a host-native double, repack it as big-endian IEEE 754 double
+//  TODO: rather than the test patterns, use actual float.h funcs
 static uint8_t * f64be(uint8_t * const p, const double input) {
 	const uint8_t * const value = (uint8_t *)&input;
 	static const double testVal = 1;
@@ -154,37 +157,6 @@ static uint8_t * amf_ecma_array_entry(uint8_t * const p, const char * const str,
 }
 
 /* ************************************************************************ */
-// some h264 output helpers
-// AVCDecoder record - some of this data comes out of the SPS for this block
-static uint8_t * h264_AVCDecoderConfigurationRecord(
-	uint8_t * p,
-	const uint8_t * const sps,
-	const uint16_t sps_length,
-	const uint8_t * const pps,
-	const uint16_t pps_length)
-{
-	*p = 0x01;	// version
-	*(p + 1) = sps[1];	// Required profile ID
-	*(p + 2) = sps[2];	// Profile compatibility
-	*(p + 3) = sps[3];	// AVC Level (3.0)
-	*(p + 4) = 0b11111100 | 0b11;	// NAL lengthSizeMinusOne (4 bytes)
-	*(p + 5) = 0b11100000 | 1;	// number of SPS sets
-	p += 6;
-
-	// write the SPS - length (uint16), then data
-	p = u16be(p, sps_length);
-	memcpy(p, sps, sps_length);
-	p += sps_length;
-
-	// write the PPS now
-	p = u16be(p, pps_length);
-	memcpy(p, pps, pps_length);
-	p += pps_length;
-
-	return p;
-}
-
-/* ************************************************************************ */
 // sets up the first 11 bytes of a tag
 //  returns pointer to the start of payload area
 static uint8_t * flv_TagHeader(uint8_t * p, const uint8_t type, const uint32_t timestamp)
@@ -232,7 +204,7 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 		fputs("librtmpcast: ERROR: rtmpcast_param_t is NULL\n", stderr);
 		return NULL;
 	}
-	if (! p->rtmp.url) {
+	if (! p->url) {
 		fputs("librtmpcast: ERROR: rtmp.url is NULL\n", stderr);
 		return NULL;
 	}
@@ -255,91 +227,35 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 	// copy the callback param
 	if (p->video.enable) {
 		// copy all video-related params
-		r->video.callback = p->video.callback;
-
 		r->video.width = p->video.width;
 		r->video.height = p->video.height;
 		r->video.framerate = p->video.framerate;
 		r->video.bitrate = p->video.bitrate;
 
 		// calculate the timestamp interval
-		
 		r->video.timestamp_increment = 1.0 / r->video.framerate;
 
-		// return code handler
-		int ret;
+		// set up the encoder
+		//  only x264 supported for now
+		r->video.encoder = video_x264_create(
+			p->video.width,
+			p->video.height,
+			p->video.framerate,
+			p->video.bitrate,
+			p->video.callback,
+			r->rtmp.tag + 11 + 5
+		);
 
-		// Initialize the x264 encoder
-		//  First set up the parameters struct
-		x264_param_t x_p;
-		ret = x264_param_default_preset(&x_p, "veryfast", "zerolatency");
-		if (ret) {
-			fprintf(stderr, "librtmpcast: ERROR: x264_param_default_preset returned %d\n", ret);
-			free(r);
-			return NULL;
-		}
-		x_p.i_log_level = X264_LOG_INFO;
-		x_p.i_threads = 1;
-		x_p.i_width = r->video.width;
-		x_p.i_height = r->video.height;
-		x_p.i_fps_num = r->video.framerate;
-		x_p.i_fps_den = 1;
-		x_p.i_keyint_max = r->video.framerate * 4; // Twitch likes keyframes every 4 sec or less
-	
-		// Enable intra refresh instead of IDR
-		//x_p.b_intra_refresh = 1;
-	
-		// Rate control - use CBR not CRF.
-		//  Chosen by setting bitrate and vbv_max_bitrate to same value.
-		x_p.rc.i_rc_method = X264_RC_ABR;
-		x_p.rc.i_bitrate = r->video.bitrate;
-		x_p.rc.i_vbv_max_bitrate = r->video.bitrate;
-		x_p.rc.i_vbv_buffer_size = r->video.bitrate;
-	
-		// Control x264 output for muxing
-		x_p.b_aud = 0; // do not generate Access Unit Delimiters
-		x_p.b_repeat_headers = 1; // Do not put SPS/PPS before each keyframe.
-		x_p.b_annexb = 0; // Annex B uses startcodes before NALU, but we want sizes
-	
-		// constraints
-		ret = x264_param_apply_profile(&x_p, "baseline");
-		if (ret) {
-			fprintf(stderr, "librtmpcast: ERROR: x264_param_apply_profile returned %d\n", ret);
-			free(r);
-			return NULL;
-		}
-	
-		/* *************************************************** */
-		// All done setting up params!  Let's open an encoder
-		r->video.encoder = x264_encoder_open(&x_p);
-		// can free the param struct now
-		x264_param_cleanup(&x_p);
-		// check the return value from video.encoder creation
-		if (! r->video.encoder) {
-			fputs("librtmpcast: ERROR: failed to create x264 encoder\n", stderr);
-			free(r);
-			return NULL;
-		}
-
-		// These are the two picture structs.  Input must be alloc()
-		//  Output will be created by the encode process
-		ret = x264_picture_alloc(&r->video.picture, X264_CSP_I420, r->video.width, r->video.height);
-		if (ret) {
-			fprintf(stderr, "librtmpcast: ERROR: x264_picture_alloc returned %d\n", ret);
-			x264_encoder_close(r->video.encoder);
-			free(r);
-			return NULL;
-		}
 	} else {
 		// clear some values in the struct
-		r->video.callback = NULL;
-
 		r->video.width = 0;
 		r->video.height = 0;
 		r->video.framerate = 0;
 		r->video.bitrate = 0;
 
 		r->video.timestamp_increment = INFINITY;
+
+		r->video.encoder = NULL;
 	}
 
 	/* *************************************************** */
@@ -384,10 +300,31 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 
 	if (r->rtmp.rtmp == NULL) {
 		fputs("Failed to create RTMP object\n", stderr);
+		audio_fdkaac_close(r->audio.encoder);
+		video_x264_close(r->video.encoder);
+		free(r->rtmp.tag);
+		return NULL;
 	}
 
-	RTMP_SetupURL(r->rtmp.rtmp, p->rtmp.url);
+	RTMP_SetupURL(r->rtmp.rtmp, p->url);
 	RTMP_EnableWrite(r->rtmp.rtmp);
+
+	// if user added a filename, open it and prep for writing
+	//  if this fails it is non-fatal
+	if (p->filename != NULL)
+	{
+		r->rtmp.flv = fopen(p->filename, "wb");
+		if (r->rtmp.flv == NULL) {
+			fprintf(stderr, "Failed to open '%s' for writing. Local file output will be disabled.\n", p->filename);
+			perror("Error reported was");
+			r->rtmp.flv = NULL;
+		} else {
+			const uint8_t flvHeader[] = { 0x46, 0x4C, 0x56, 0x01, (p->audio.enable ? 0x04 : 0) | (p->video.enable ? 0x01 : 0), 0, 0, 0, 9, 0, 0, 0, 0 };
+			fwrite(flvHeader, 1, 13, r->rtmp.flv);
+		}
+	} else {
+		r->rtmp.flv = NULL;
+	}
 
 	return r;
 }
@@ -423,8 +360,9 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 	p = amf_ecma_array_entry(p, "height", r->video.height);
 	p = amf_ecma_array_entry(p, "framerate", r->video.framerate);
 	p = amf_ecma_array_entry(p, "videocodecid", 7);
+	p = amf_ecma_array_entry(p, "videodatarate", r->video.bitrate);
 	p = amf_ecma_array_entry(p, "audiocodecid", 10);
-	p = amf_ecma_array_entry(p, "audiodatarate", r->audio.bitrate * 1024);
+	p = amf_ecma_array_entry(p, "audiodatarate", r->audio.bitrate);
 	p = amf_ecma_array_entry(p, "audiosamplerate", r->audio.samplerate);
 	//p = amf_ecma_array_entry(p, "audiosamplesize", 16);
 	p = amf_boolean(pstring(p, "stereo"), r->audio.channels == 2);
@@ -438,10 +376,7 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 		fputs("Failed to RTMP_Write\n", stderr);
 		return 0;
 	}
-
-	// write the h.264 header now
-	x264_nal_t * pp_nal; int pi_nal;
-	int header_size = x264_encoder_headers(r->video.encoder, &pp_nal, &pi_nal);
+	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
 	// ready to write the tag
 	// First event is the onMetaData, which uses AMF (Action Meta Format)
@@ -450,12 +385,15 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 
 	// Set up an AVC Video Packet (is keyframe, type 0)
 	p = flv_AVCVideoPacket(p, 1, 0, 0);
-	// write the decoder config record, the initial SPS and PPS
-	p = h264_AVCDecoderConfigurationRecord(p,
-			pp_nal[0].p_payload + 4,
-			pp_nal[0].i_payload,
-			pp_nal[1].p_payload + 4,
-			pp_nal[1].i_payload);
+
+	// video init
+	int video_size = video_x264_init(r->video.encoder);
+	if (video_size < 0) {
+		// error occurred
+		fputs("Failed to fdkaac_init\n", stderr);
+		return 0;
+	}
+	p += video_size;
 
 	// calculate tag size and write it
 	tagSize = flv_TagFinish(r->rtmp.tag, p);
@@ -464,6 +402,7 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 		fputs("Failed to RTMP_Write\n", stderr);
 		return 0;
 	}
+	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
 	/* ************************************************************************** */
 	// NOW!!! we have set up the video encoder.
@@ -476,7 +415,7 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 
 	int audio_size = audio_fdkaac_init(r->audio.encoder);
 	if (audio_size < 0) {
-	  // error occurred
+		// error occurred
 		fputs("Failed to fdkaac_init\n", stderr);
 		return 0;
 	}
@@ -488,6 +427,7 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 		fputs("Failed to RTMP_Write\n", stderr);
 		return 0;
 	}
+	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
 	// Starting timestamp of our video
 	r->rtmp.start = getTimestamp();
@@ -507,39 +447,37 @@ double rtmpcast_update (struct rtmpcast_t * r)
 	// find out if we need to emit any frames
 
 	while (now >= r->video.timestamp_next ||
-	       now >= r->audio.timestamp_next)
+		now >= r->audio.timestamp_next)
 	{
 		//printf("now = %lf, vid_next = %lf, aud_next = %lf\n", now, r->video.timestamp_next, r->audio.timestamp_next);
 		// prioritize the most recent timestamp
 		if (r->video.timestamp_next < r->audio.timestamp_next) {
-			if (r->video.callback) {
-				r->video.callback(r->video.picture.img.plane);
-				/* Encode an x264 frame */
-				x264_nal_t * nals;
-				int i_nals;
-				x264_picture_t pic_out;
-				int frame_size = x264_encoder_encode(r->video.encoder, &nals, &i_nals, &r->video.picture, &pic_out);
-
-				if (frame_size <= 0) {
-					// error in encoding
-					fputs("Error when encoding frame\n", stderr);
-				}
-
+			if (r->video.encoder) {
 				// Post our video frame
 				uint8_t * p = flv_TagHeader(r->rtmp.tag, 9, 1000 * (r->video.timestamp_next - r->rtmp.start));
 
-				// write every NALU to the packet for this pic
-				//  x264 guarantees all p_payload are sequential
-				p = flv_AVCVideoPacket(p, pic_out.b_keyframe, 1, 0);
-				memcpy(p, nals[0].p_payload, frame_size);
-				p += frame_size;
+				// call out to the chosen encoder
+				struct video_return_t v = video_x264_update(r->video.encoder);
 
-				// calculate tag size and write it
-				uint32_t tagSize = flv_TagFinish(r->rtmp.tag, p);
+				if (v.size < 0) {
+					// error in encoding
+					fputs("Error when encoding video\n", stderr);
+					return 0;
+				} else if (v.size > 0) {
+					// the encoder did something, need to package it up and ship
+					p = flv_AVCVideoPacket(p, v.keyframe, 1, 0);
 
-				//  cast to char* avoids a warning
-				if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
-					fputs("Failed to RTMP_Write a frame\n", stderr);
+					// skip the encoder-written tag
+					p += v.size;
+
+					// calculate tag size and write it
+					uint32_t tagSize = flv_TagFinish(r->rtmp.tag, p);
+
+					//  cast to char* avoids a warning
+					if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
+						fputs("Failed to RTMP_Write a frame\n", stderr);
+					}
+					if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 				}
 			}
 			r->video.timestamp_next += r->video.timestamp_increment;
@@ -567,6 +505,7 @@ double rtmpcast_update (struct rtmpcast_t * r)
 				if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
 					fputs("Failed to RTMP_Write audio block\n", stderr);
 				}
+				if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 			}
 			r->audio.timestamp_next += r->audio.timestamp_increment;
 		}
@@ -607,20 +546,6 @@ double rtmpcast_update (struct rtmpcast_t * r)
 void rtmpcast_close (struct rtmpcast_t * r)
 {
 	/* Flush delayed frames for a clean shutdown */
-	/*
-	   while( x264_encoder_delayed_frames( h ) )
-	   {
-	   i_frame_size = x264_encoder_encode( h, &nal, &i_nal, NULL, &pic_out );
-	   if( i_frame_size < 0 )
-	   goto fail;
-	   else if( i_frame_size )
-	   {
-	   if( !fwrite( nal->p_payload, i_frame_size, 1, stdout ) )
-	   goto fail;
-	   }
-	   }
-	 */
-
 	// send the end-of-stream indicator
 	uint8_t * p = flv_TagHeader(r->rtmp.tag, 9, 1000 * (r->video.timestamp_next - r->rtmp.start));
 	// write the empty-body "stream end" tag
@@ -632,11 +557,14 @@ void rtmpcast_close (struct rtmpcast_t * r)
 	if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
 		fputs("Failed to RTMP_Write\n", stderr);
 	}
+	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
 	/* *************************************************** */
 	// CLEANUP CODE
 	// Shut down
+	if (r->rtmp.flv) fclose(r->rtmp.flv);
 	RTMP_Free(r->rtmp.rtmp);
+	audio_fdkaac_close(r->audio.encoder);
+	video_x264_close(r->video.encoder);
 	free(r->rtmp.tag);
-	x264_picture_clean(&r->video.picture);
 }

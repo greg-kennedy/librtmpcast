@@ -1,5 +1,5 @@
-#ifndef AUDIO_FDKAAC_H
-#define AUDIO_FDKAAC_H
+#ifndef RTMPCAST_AUDIO_FDKAAC_H
+#define RTMPCAST_AUDIO_FDKAAC_H
 
 struct encoder_audio;
 

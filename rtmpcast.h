@@ -1,5 +1,5 @@
-#ifndef RTMPCAST_H_
-#define RTMPCAST_H_
+#ifndef RTMPCAST_RTMPCAST_H
+#define RTMPCAST_RTMPCAST_H
 
 #include <stdint.h>
 
@@ -9,14 +9,13 @@ struct rtmpcast_t;
 // struct containing parameters for the connection
 struct rtmpcast_param_t
 {
-	struct {
-		char * url;
-	} rtmp;
+	char * url;
+	char * filename;
 
 	struct {
 		int enable;
 
-		int (* callback)(uint8_t * frame[3]);
+		int (* callback)(void *);
 
 		unsigned int width, height;
 		unsigned int framerate;
@@ -26,7 +25,7 @@ struct rtmpcast_param_t
 	struct {
 		int enable;
 
-		int (* callback)(int16_t * buffer);
+		int (* callback)(void *);
 
 		unsigned int samplerate;
 		unsigned int channels;

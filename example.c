@@ -26,6 +26,9 @@ Generates a video test pattern and some audio tones,
 #define AUDIO_BITRATE 128
 
 // GLOBALS
+// set to TRUE to write a companion .flv file for debugging
+//#define DEBUG 1
+
 // Current frame number
 static unsigned int frame_number = 0;
 static unsigned int audio_packet_number = 0;
@@ -85,9 +88,12 @@ int main(int argc, char * argv[])
 
 	/* *************************************************** */
 	// Set up parameters to create the librtmpcast object
-	struct rtmpcast_param_t param;
+	struct rtmpcast_param_t param = {0};
 
-	param.rtmp.url = argv[1];
+	param.url = argv[1];
+#if DEBUG
+	param.filename = "example.flv";
+#endif
 
 	param.video.enable = 1;
 	param.video.callback = callback_video;
