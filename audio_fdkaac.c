@@ -17,10 +17,7 @@ static int out_buffer_element_sizes[] = { sizeof(unsigned char) };
 static int out_buffer_identifiers[]   = { OUT_BITSTREAM_DATA };
 
 // structure definition for the encoder (private data)
-struct encoder_audio {
-	// user callback to generate more audio
-	int (* callback)(short int * buffer);
-
+struct encoder_audio_fdkaac {
 	HANDLE_AACENCODER encoder;
 	AACENC_InfoStruct encoder_info;
 	AACENC_BufDesc in_buf, out_buf;
@@ -115,7 +112,7 @@ struct encoder_audio * audio_fdkaac_create(
 	const unsigned int channels,
 	const unsigned int bitrate,
 	const unsigned int samplerate,
-	int (* callback)(INT_PCM * buffer),
+	int (* callback)(void * input),
 	unsigned char * const destination)
 {
 	// create a structure
@@ -126,24 +123,35 @@ struct encoder_audio * audio_fdkaac_create(
 		return NULL;
 	}
 
+	// create private area
+	struct encoder_audio_fdkaac * o = malloc(sizeof(struct encoder_audio_fdkaac));
+	if (o == NULL) {
+		perror("librtmpcast: ERROR: audio_fdkaac::audio_fdkaac_create: malloc() returned NULL");
+		free(e);
+		return NULL;
+	}
+	e->opaque = o;
+
 	// store the callback
 	e->callback = callback;
 
 	// get encoder with support for only basic (AAC-LC) and 1 or 2 channels
-	AACENC_ERROR err = aacEncOpen(&e->encoder, 0x01, channels);
+	AACENC_ERROR err = aacEncOpen(&o->encoder, 0x01, channels);
 
 	if (err != AACENC_OK) {
 		print_aacenc_error("Failed calling aacEncOpen", err);
+		free(o);
 		free(e);
 		return NULL;
 	}
 
 	// Set all parameters
 	//  This macro wraps error printout / handling for us
-	#define aacSetParam(x, y) err = aacEncoder_SetParam(e->encoder, x, y); \
+	#define aacSetParam(x, y) err = aacEncoder_SetParam(o->encoder, x, y); \
 		if (err != AACENC_OK) { \
 		print_aacenc_error("Failed calling aacSetParam(" #x ", " #y ")", err); \
-			aacEncClose(&e->encoder); \
+			aacEncClose(&o->encoder); \
+			free(o); \
 			free(e); \
 			return NULL; \
 		}
@@ -162,55 +170,58 @@ struct encoder_audio * audio_fdkaac_create(
 	aacSetParam(AACENC_CHANNELORDER, 1);
 
 	// This strange call is needed to "lock in" the settings for encoding
-	err = aacEncEncode(e->encoder, NULL, NULL, NULL, NULL);
+	err = aacEncEncode(o->encoder, NULL, NULL, NULL, NULL);
 
 	if (err != AACENC_OK) {
 		print_aacenc_error("Failed calling initial aacEncEncode", err);
-		aacEncClose(&e->encoder);
+		aacEncClose(&o->encoder);
+		free(e->opaque);
 		free(e);
 		return NULL;
 	}
 
 	// Now we have encoder info in a struct and can use it for writing audio packets
-	err = aacEncInfo(e->encoder, &e->encoder_info);
+	err = aacEncInfo(o->encoder, &o->encoder_info);
 
 	if (err != AACENC_OK) {
 		print_aacenc_error("Failed to copy encoder info", err);
-		aacEncClose(&e->encoder);
+		aacEncClose(&o->encoder);
+		free(e->opaque);
 		free(e);
 		return NULL;
 	}
 
 	// ////////
 	// alloc the INPUT buffer
-	e->in_buf.numBufs           = 1;
-	e->in_buffer_sizes[0]       = 1024 * channels * sizeof(INT_PCM);
-	e->in_buf.bufSizes          = e->in_buffer_sizes;
-	e->in_buffers[0]            = malloc(e->in_buffer_sizes[0]);
+	o->in_buf.numBufs           = 1;
+	o->in_buffer_sizes[0]       = 1024 * channels * sizeof(INT_PCM);
+	o->in_buf.bufSizes          = o->in_buffer_sizes;
+	o->in_buffers[0]            = malloc(o->in_buffer_sizes[0]);
 
-	if (e->in_buffers[0] == NULL) {
+	if (o->in_buffers[0] == NULL) {
 		perror("librtmpcast: ERROR: audio_fdkaac::audio_fdkaac_create: malloc() returned NULL");
-		aacEncClose(&e->encoder);
+		aacEncClose(&o->encoder);
+		free(o);
 		free(e);
 		return NULL;
 	}
 
-	e->in_buf.bufs              = e->in_buffers;
+	o->in_buf.bufs              = o->in_buffers;
 	// use the constants
-	e->in_buf.bufferIdentifiers = in_buffer_identifiers;
-	e->in_buf.bufElSizes        = in_buffer_element_sizes;
+	o->in_buf.bufferIdentifiers = in_buffer_identifiers;
+	o->in_buf.bufElSizes        = in_buffer_element_sizes;
 
 	// ////////
 	// set up the OUTPUT buffer
-	e->out_buf.numBufs           = 1;
-	e->out_buffer_sizes[0]       = 768 * channels * sizeof(unsigned char);
-	e->out_buf.bufSizes          = e->out_buffer_sizes;
+	o->out_buf.numBufs           = 1;
+	o->out_buffer_sizes[0]       = 768 * channels * sizeof(unsigned char);
+	o->out_buf.bufSizes          = o->out_buffer_sizes;
 
-	e->out_buffers[0]            = destination;
-	e->out_buf.bufs              = e->out_buffers;
+	o->out_buffers[0]            = destination;
+	o->out_buf.bufs              = o->out_buffers;
 	// use the constants
-	e->out_buf.bufferIdentifiers = out_buffer_identifiers;
-	e->out_buf.bufElSizes        = out_buffer_element_sizes;
+	o->out_buf.bufferIdentifiers = out_buffer_identifiers;
+	o->out_buf.bufElSizes        = out_buffer_element_sizes;
 
 	return e;
 }
@@ -218,19 +229,22 @@ struct encoder_audio * audio_fdkaac_create(
 // Copy the encoder info into the provided buffer, and return the length of copied bytes
 int audio_fdkaac_init(const struct encoder_audio * const e)
 {
-	memcpy(e->out_buffers[0], e->encoder_info.confBuf, e->encoder_info.confSize);
-	return e->encoder_info.confSize;
+	struct encoder_audio_fdkaac * o = e->opaque;
+	memcpy(o->out_buffers[0], o->encoder_info.confBuf, o->encoder_info.confSize);
+	return o->encoder_info.confSize;
 }
 
 // Encode a block and put it into the provided buffer.  Return bytes copied.
 int audio_fdkaac_update(const struct encoder_audio * const e)
 {
+	struct encoder_audio_fdkaac * o = e->opaque;
+
 	AACENC_ERROR err;
 	/* *************************************************** */
 	// CALL THE AUDIO CALLBACK
 	AACENC_InArgs in_args;
 	in_args.numAncBytes = 0;
-	int callback_ret = e->callback(e->in_buffers[0]);
+	int callback_ret = e->callback(o->in_buffers[0]);
 
 	// User indicated error, return
 	if (callback_ret < 0)
@@ -241,7 +255,7 @@ int audio_fdkaac_update(const struct encoder_audio * const e)
 	// Perform the encode
 	//  Set output buffer to be start of tag
 	AACENC_OutArgs out_args; // does not need init - is set by encode
-	err = aacEncEncode(e->encoder, &e->in_buf, &e->out_buf, &in_args, &out_args);
+	err = aacEncEncode(o->encoder, &o->in_buf, &o->out_buf, &in_args, &out_args);
 
 	if (err != AACENC_OK) {
 		print_aacenc_error("Failed to encode audio", err);
@@ -255,7 +269,10 @@ int audio_fdkaac_update(const struct encoder_audio * const e)
 // shut everything down
 void audio_fdkaac_close(struct encoder_audio * const e)
 {
-	free(e->in_buffers[0]);
-	aacEncClose(&e->encoder);
+	struct encoder_audio_fdkaac * o = e->opaque;
+
+	free(o->in_buffers[0]);
+	aacEncClose(&o->encoder);
+	free(o);
 	free(e);
 }

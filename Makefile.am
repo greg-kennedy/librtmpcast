@@ -3,7 +3,7 @@ ACLOCAL_AMFLAGS = -I m4
 AM_CPPFLAGS = -Wall -Wextra
 
 lib_LTLIBRARIES = librtmpcast.la
-librtmpcast_la_SOURCES = rtmpcast.c
+librtmpcast_la_SOURCES = rtmpcast.c audio_passthrough.c
 librtmpcast_la_CFLAGS = $(RTMP_CFLAGS)
 librtmpcast_la_LDFLAGS = -version-info 1:0:0 $(RTMP_LIBS)
 
