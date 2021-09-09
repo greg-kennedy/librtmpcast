@@ -163,7 +163,8 @@ struct encoder_audio * audio_fdkaac_create(
 	aacSetParam(AACENC_TRANSMUX, TT_MP4_RAW);
 	// Better quality at the expense of processing power
 	//aacSetParam(AACENC_AFTERBURNER,1);
-	aacSetParam(AACENC_BITRATE, bitrate);
+	// Bitrate everywhere is in kbps but fdk-aac expects bps
+	aacSetParam(AACENC_BITRATE, bitrate * 1024);
 	aacSetParam(AACENC_SAMPLERATE, samplerate);
 	// channel arrangement
 	aacSetParam(AACENC_CHANNELMODE, (channels == 2 ? MODE_2 : MODE_1));

@@ -273,7 +273,7 @@ struct rtmpcast_t * rtmpcast_init (const struct rtmpcast_param_t * const p)
 		//  only fdkaac supported for now
 		r->audio.encoder = audio_fdkaac_create(
 			p->audio.channels,
-			p->audio.bitrate * 1024,
+			p->audio.bitrate,
 			p->audio.samplerate,
 			p->audio.callback,
 			r->rtmp.tag + 11 + 2
@@ -355,17 +355,23 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 	// script data type is "onMetaData"
 	p = amf_string(p, "onMetaData");
 	// associative array with various stream parameters
-	p = amf_ecma_array(p, 8);
-	p = amf_ecma_array_entry(p, "width", r->video.width);
-	p = amf_ecma_array_entry(p, "height", r->video.height);
-	p = amf_ecma_array_entry(p, "framerate", r->video.framerate);
-	p = amf_ecma_array_entry(p, "videocodecid", 7);
-	p = amf_ecma_array_entry(p, "videodatarate", r->video.bitrate);
-	p = amf_ecma_array_entry(p, "audiocodecid", 10);
-	p = amf_ecma_array_entry(p, "audiodatarate", r->audio.bitrate);
-	p = amf_ecma_array_entry(p, "audiosamplerate", r->audio.samplerate);
-	//p = amf_ecma_array_entry(p, "audiosamplesize", 16);
-	p = amf_boolean(pstring(p, "stereo"), r->audio.channels == 2);
+	p = amf_ecma_array(p,
+		(r->video.encoder ? 5 : 0) +
+		(r->audio.encoder ? 4 : 0));
+	if (r->video.encoder) {
+		p = amf_ecma_array_entry(p, "width", r->video.width);
+		p = amf_ecma_array_entry(p, "height", r->video.height);
+		p = amf_ecma_array_entry(p, "framerate", r->video.framerate);
+		p = amf_ecma_array_entry(p, "videocodecid", 7);
+		p = amf_ecma_array_entry(p, "videodatarate", r->video.bitrate);
+	}
+	if (r->audio.encoder) {
+		p = amf_ecma_array_entry(p, "audiocodecid", 10);
+		p = amf_ecma_array_entry(p, "audiodatarate", r->audio.bitrate);
+		p = amf_ecma_array_entry(p, "audiosamplerate", r->audio.samplerate);
+		//p = amf_ecma_array_entry(p, "audiosamplesize", 16);
+		p = amf_boolean(pstring(p, "stereo"), r->audio.channels == 2);
+	}
 	// finalize the array
 	p = amf_ecma_array_end(p);
 
@@ -378,62 +384,62 @@ int rtmpcast_connect (struct rtmpcast_t * const r)
 	}
 	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
-	// ready to write the tag
-	// First event is the onMetaData, which uses AMF (Action Meta Format)
-	//  to serialize basic stream params
-	p = flv_TagHeader(r->rtmp.tag, 9, 0);
+	if (r->video.encoder) {
+		p = flv_TagHeader(r->rtmp.tag, 9, 0);
 
-	// Set up an AVC Video Packet (is keyframe, type 0)
-	p = flv_AVCVideoPacket(p, 1, 0, 0);
+		// Set up an AVC Video Packet (is keyframe, type 0)
+		p = flv_AVCVideoPacket(p, 1, 0, 0);
 
-	// video init
-	int video_size = video_x264_init(r->video.encoder);
-	if (video_size < 0) {
-		// error occurred
-		fputs("Failed to fdkaac_init\n", stderr);
-		return 0;
+		// video init
+		int video_size = video_x264_init(r->video.encoder);
+		if (video_size < 0) {
+			// error occurred
+			fputs("Failed to fdkaac_init\n", stderr);
+			return 0;
+		}
+		p += video_size;
+
+		// calculate tag size and write it
+		tagSize = flv_TagFinish(r->rtmp.tag, p);
+
+		if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
+			fputs("Failed to RTMP_Write\n", stderr);
+			return 0;
+		}
+		if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 	}
-	p += video_size;
-
-	// calculate tag size and write it
-	tagSize = flv_TagFinish(r->rtmp.tag, p);
-
-	if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
-		fputs("Failed to RTMP_Write\n", stderr);
-		return 0;
-	}
-	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
 	/* ************************************************************************** */
 	// NOW!!! we have set up the video encoder.
 	//  so let's do audio next - the Initial Audio Packet.
-	p = flv_TagHeader(r->rtmp.tag, 8, 0);
-	// 0xA0 for "AAC"
-	// 0x0F for flags (44khz, stereo, 16bit)
-	*p = 0xAF; p++;
-	*p = 0; p++;
+	if (r->audio.encoder) {
+		p = flv_TagHeader(r->rtmp.tag, 8, 0);
+		// 0xA0 for "AAC"
+		// 0x0F for flags (44khz, stereo, 16bit)
+		*p = 0xAF; p++;
+		*p = 0; p++;
 
-	int audio_size = audio_fdkaac_init(r->audio.encoder);
-	if (audio_size < 0) {
-		// error occurred
-		fputs("Failed to fdkaac_init\n", stderr);
-		return 0;
-	}
-	p += audio_size;
-	// calculate tag size and write it
-	tagSize = flv_TagFinish(r->rtmp.tag, p);
+		int audio_size = audio_fdkaac_init(r->audio.encoder);
+		if (audio_size < 0) {
+			// error occurred
+			fputs("Failed to fdkaac_init\n", stderr);
+			return 0;
+		}
+		p += audio_size;
+		// calculate tag size and write it
+		tagSize = flv_TagFinish(r->rtmp.tag, p);
 
-	if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
-		fputs("Failed to RTMP_Write\n", stderr);
-		return 0;
+		if (RTMP_Write(r->rtmp.rtmp, (const char *)r->rtmp.tag, tagSize) <= 0) {
+			fputs("Failed to RTMP_Write\n", stderr);
+			return 0;
+		}
+		if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 	}
-	if (r->rtmp.flv) fwrite(r->rtmp.tag, 1, tagSize, r->rtmp.flv);
 
 	// Starting timestamp of our video
 	r->rtmp.start = getTimestamp();
-
-	r->video.timestamp_next = r->rtmp.start + r->video.timestamp_increment;
-	r->audio.timestamp_next = r->rtmp.start + r->audio.timestamp_increment;
+	r->video.timestamp_next = (r->video.encoder ? r->rtmp.start : INFINITY);
+	r->audio.timestamp_next = (r->audio.encoder ? r->rtmp.start : INFINITY);
 
 	return 1;
 }
@@ -564,7 +570,7 @@ void rtmpcast_close (struct rtmpcast_t * r)
 	// Shut down
 	if (r->rtmp.flv) fclose(r->rtmp.flv);
 	RTMP_Free(r->rtmp.rtmp);
-	audio_fdkaac_close(r->audio.encoder);
-	video_x264_close(r->video.encoder);
+	if (r->audio.encoder) audio_fdkaac_close(r->audio.encoder);
+	if (r->video.encoder) video_x264_close(r->video.encoder);
 	free(r->rtmp.tag);
 }
